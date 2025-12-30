@@ -1,0 +1,363 @@
+﻿import React, { useEffect, useMemo, useState } from 'react';
+import { toast } from 'react-hot-toast';
+import { AppLayout } from '../components/layout/AppLayout';
+import { useAuth } from '../auth/useAuth';
+import { precallList, preinterviewMarksSave, preinterviewStatus, testLinkCreate } from '../api/candidates';
+import { saveRejectRevertDraft } from '../utils/storage';
+import { LoadingOverlay, Spinner } from '../components/ui/Spinner';
+import { Collapsible } from '../components/ui/Collapsible';
+
+function todayIsoDate() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function fmtDateTime(value) {
+  if (!value) return '';
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleString();
+}
+
+function promptDatetimeLocal(message, initialDate) {
+  const fallback = initialDate ? new Date(initialDate) : null;
+  const pad = (n) => String(n).padStart(2, '0');
+  const initial =
+    fallback && !Number.isNaN(fallback.getTime())
+      ? `${fallback.getFullYear()}-${pad(fallback.getMonth() + 1)}-${pad(fallback.getDate())}T${pad(fallback.getHours())}:${pad(
+          fallback.getMinutes()
+        )}`
+      : '';
+  const val = window.prompt(message + ' (YYYY-MM-DDTHH:mm):', initial);
+  if (val == null) return null;
+  const trimmed = String(val).trim();
+  if (!trimmed) return '';
+  const dt = new Date(trimmed);
+  if (Number.isNaN(dt.getTime())) return 'INVALID';
+  return dt.toISOString();
+}
+
+export function PreinterviewPage() {
+  const { token } = useAuth();
+
+  const [date, setDate] = useState(todayIsoDate());
+  const [jobRole, setJobRole] = useState('ALL');
+  const [loading, setLoading] = useState(false);
+  const [items, setItems] = useState([]);
+  const [marksDraft, setMarksDraft] = useState({});
+  const [linkByCandidate, setLinkByCandidate] = useState({});
+  const [busyKey, setBusyKey] = useState('');
+
+  const roleTabs = useMemo(() => {
+    const roles = Array.from(new Set(items.map((x) => x.jobRole).filter(Boolean)));
+    roles.sort((a, b) => String(a).localeCompare(String(b)));
+    return ['ALL', ...roles];
+  }, [items]);
+
+  async function load(nextDate, nextRole) {
+    setLoading(true);
+    try {
+      const payload = {
+        date: nextDate,
+        jobRole: nextRole && nextRole !== 'ALL' ? nextRole : '',
+      };
+      const res = await precallList(token, payload);
+      const list = res.items ?? [];
+
+      // Phase 14 shows candidates whose pre-interview datetime is fixed.
+      // We treat `preCallAt` as the pre-interview datetime (set in Phase 13 Call Done).
+      // Also, once online test is submitted the candidate moves forward to in-person pipeline,
+      // so remove them from this stage.
+      setItems(list.filter((x) => x.preCallAt && !x.onlineTestResult));
+    } catch (e) {
+      toast.error(e?.message || 'Failed to load');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load(date, jobRole);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, jobRole]);
+
+  const filtered = useMemo(() => {
+    if (jobRole === 'ALL') return items;
+    return items.filter((x) => x.jobRole === jobRole);
+  }, [items, jobRole]);
+
+  const scheduled = useMemo(() => filtered.filter((x) => String(x.preInterviewStatus || '').toUpperCase() !== 'APPEARED'), [filtered]);
+  const appeared = useMemo(() => filtered.filter((x) => String(x.preInterviewStatus || '').toUpperCase() === 'APPEARED'), [filtered]);
+
+  async function onAppeared(it) {
+    const key = `${it.candidateId}:APPEARED`;
+    setBusyKey(key);
+    try {
+      const res = await preinterviewStatus(token, {
+        requirementId: it.requirementId,
+        candidateId: it.candidateId,
+        op: 'APPEARED',
+      });
+      toast.success('Marked Appeared');
+      setItems((prev) =>
+        prev.map((x) => (x.candidateId === it.candidateId ? { ...x, preInterviewStatus: res.preInterviewStatus || 'APPEARED' } : x))
+      );
+    } catch (e) {
+      toast.error(e?.message || 'Failed');
+    } finally {
+      setBusyKey('');
+    }
+  }
+
+  async function onReschedule(it) {
+    const nextIso = promptDatetimeLocal('New pre-interview date/time', it.preCallAt);
+    if (nextIso == null) return;
+    if (nextIso === 'INVALID') {
+      toast.error('Invalid date/time');
+      return;
+    }
+    if (nextIso === '') {
+      toast.error('Date/time required');
+      return;
+    }
+
+    const key = `${it.candidateId}:RESCHEDULE`;
+    setBusyKey(key);
+    try {
+      const res = await preinterviewStatus(token, {
+        requirementId: it.requirementId,
+        candidateId: it.candidateId,
+        op: 'RESCHEDULE',
+        preInterviewAt: nextIso,
+      });
+      toast.success('Rescheduled');
+      setItems((prev) => prev.map((x) => (x.candidateId === it.candidateId ? { ...x, preCallAt: res.preInterviewAt || nextIso } : x)));
+    } catch (e) {
+      toast.error(e?.message || 'Failed');
+    } finally {
+      setBusyKey('');
+    }
+  }
+
+  async function onReject(it) {
+    const remark = window.prompt('Reject remark (required):');
+    if (remark == null) return;
+    if (!String(remark).trim()) {
+      toast.error('Remark required');
+      return;
+    }
+
+    const key = `${it.candidateId}:REJECT`;
+    setBusyKey(key);
+    try {
+      await preinterviewStatus(token, {
+        requirementId: it.requirementId,
+        candidateId: it.candidateId,
+        op: 'REJECT',
+        remark: String(remark).trim(),
+      });
+      saveRejectRevertDraft({ requirementId: it.requirementId, candidateId: it.candidateId });
+      toast.success('Rejected');
+      setItems((prev) => prev.filter((x) => x.candidateId !== it.candidateId));
+    } catch (e) {
+      toast.error(e?.message || 'Failed');
+    } finally {
+      setBusyKey('');
+    }
+  }
+
+  async function onSaveMarks(it) {
+    const draft = marksDraft[it.candidateId];
+    if (draft == null || String(draft).trim() === '') {
+      toast.error('Enter marks');
+      return;
+    }
+
+    const key = `${it.candidateId}:MARKS`;
+    setBusyKey(key);
+    try {
+      const res = await preinterviewMarksSave(token, {
+        requirementId: it.requirementId,
+        candidateId: it.candidateId,
+        marks: String(draft).trim(),
+      });
+      toast.success('Marks saved');
+      setItems((prev) => prev.map((x) => (x.candidateId === it.candidateId ? { ...x, preInterviewMarks: res.preInterviewMarks } : x)));
+    } catch (e) {
+      toast.error(e?.message || 'Failed');
+    } finally {
+      setBusyKey('');
+    }
+  }
+
+  async function onGenerateLink(it) {
+    const key = `${it.candidateId}:LINK`;
+    setBusyKey(key);
+    try {
+      const res = await testLinkCreate(token, { requirementId: it.requirementId, candidateId: it.candidateId });
+      const url = `${window.location.origin}${window.location.pathname}#/test?token=${encodeURIComponent(res.token)}`;
+      setLinkByCandidate((prev) => ({ ...prev, [it.candidateId]: { url, token: res.token, expiresAt: res.expiresAt } }));
+      toast.success('Test link created');
+    } catch (e) {
+      toast.error(e?.message || 'Failed');
+    } finally {
+      setBusyKey('');
+    }
+  }
+
+  async function onCopyLink(it) {
+    const link = linkByCandidate[it.candidateId]?.url;
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      toast.success('Copied');
+    } catch {
+      toast.error('Copy failed');
+    }
+  }
+
+  return (
+    <AppLayout>
+      <div className="card">
+        <h2 style={{ marginTop: 0 }}>Pre-interview Scheduled</h2>
+
+        <div className="row" style={{ gap: 12, alignItems: 'flex-end' }}>
+          <div>
+            <div className="small">Walk-in Date</div>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </div>
+          <div className="small" style={{ marginLeft: 'auto' }}>
+            {loading ? 'Loadingâ€¦' : `Total: ${filtered.length}`}
+          </div>
+        </div>
+
+        <div style={{ height: 12 }} />
+        <div className="tabs">
+          {roleTabs.map((r) => (
+            <button
+              key={r}
+              className={['tab', jobRole === r ? 'active' : ''].join(' ')}
+              onClick={() => setJobRole(r)}
+              type="button"
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ height: 12 }} />
+
+        <div className="card" style={{ background: '#fafafa' }}>
+          <strong>Scheduled</strong>
+          <div className="small" style={{ marginTop: 6 }}>
+            Candidates with pre-interview date/time fixed (from Precall â€œCall Doneâ€).
+          </div>
+          <div style={{ height: 10 }} />
+
+          {scheduled.length === 0 ? (
+            <div className="small">No candidates.</div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10 }}>
+              {scheduled.map((it) => (
+                <div key={it.candidateId} className="card" style={{ background: '#fff' }}>
+                  <div className="row" style={{ alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontWeight: 700 }}>{it.candidateName}</div>
+                      <div className="small">
+                        {it.jobTitle ? `${it.jobTitle} Â· ` : ''}
+                        {it.jobRole} Â· {it.mobile}
+                      </div>
+                      <div className="small" style={{ marginTop: 4 }}>
+                        Pre-interview: <b>{fmtDateTime(it.preCallAt)}</b>
+                      </div>
+                    </div>
+
+                    <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      <button className="button" type="button" onClick={() => onAppeared(it)}>
+                        Appeared
+                      </button>
+                      <button className="button" type="button" onClick={() => onReschedule(it)}>
+                        Reschedule
+                      </button>
+                      <button className="button danger" type="button" onClick={() => onReject(it)}>
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ height: 14 }} />
+
+        <div className="card" style={{ background: '#fafafa' }}>
+          <strong>Pre-interview Marks</strong>
+          <div className="small" style={{ marginTop: 6 }}>
+            Only candidates marked Appeared.
+          </div>
+          <div style={{ height: 10 }} />
+
+          {appeared.length === 0 ? (
+            <div className="small">No candidates.</div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 10 }}>
+              {appeared.map((it) => {
+                const link = linkByCandidate[it.candidateId];
+                return (
+                  <div key={it.candidateId} className="card" style={{ background: '#fff' }}>
+                    <div className="row" style={{ alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                      <div style={{ minWidth: 240 }}>
+                        <div style={{ fontWeight: 700 }}>{it.candidateName}</div>
+                        <div className="small">
+                          {it.jobTitle ? `${it.jobTitle} Â· ` : ''}
+                          {it.jobRole} Â· {it.mobile}
+                        </div>
+                        <div className="small" style={{ marginTop: 4 }}>
+                          Pre-interview: <b>{fmtDateTime(it.preCallAt)}</b>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                        <input
+                          style={{ width: 120 }}
+                          placeholder="Marks"
+                          value={marksDraft[it.candidateId] ?? it.preInterviewMarks ?? ''}
+                          onChange={(e) => setMarksDraft((p) => ({ ...p, [it.candidateId]: e.target.value }))}
+                        />
+                        <button className="button" type="button" onClick={() => onSaveMarks(it)}>
+                          Save Marks
+                        </button>
+                        <button className="button primary" type="button" onClick={() => onGenerateLink(it)}>
+                          Generate Test Link
+                        </button>
+
+                        {link?.url ? (
+                          <button className="button" type="button" onClick={() => onCopyLink(it)}>
+                            Copy Link
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    {link?.url ? (
+                      <div className="small" style={{ marginTop: 8, wordBreak: 'break-all' }}>
+                        Link: {link.url}
+                        {link.expiresAt ? ` (expires: ${fmtDateTime(link.expiresAt)})` : ''}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </AppLayout>
+  );
+}
+
